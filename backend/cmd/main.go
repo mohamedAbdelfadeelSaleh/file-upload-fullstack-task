@@ -26,9 +26,17 @@ func main() {
 
 	// Setup router
 	r := mux.NewRouter()
+
 	r.HandleFunc("/upload", uploadHandler.UploadCSV).Methods("POST")
 	r.HandleFunc("/students", studentHandler.ListStudents).Methods("GET")
 
+	////////////////////////////////////////////////////////////////////////////////////////
+	progressHandler := handler.NewProgressHandler(uploadService)
+
+	r.HandleFunc("/progress", progressHandler.GetAllProgress).Methods("GET")
+	r.HandleFunc("/progress/file", progressHandler.GetFileProgress).Methods("GET")
+
+	////////////////////////////////////////////////////////////////////////////////////////
 	// Create uploads directory
 	if err := os.Mkdir("uploads", os.ModePerm); err != nil && !os.IsExist(err) {
 		log.Fatal("Failed to create uploads directory:", err)
