@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:latest
+    container_name: postgres
+    environment:
+      POSTGRES_USER: yoru
+      POSTGRES_PASSWORD: newpassword
+      POSTGRES_DB: studentdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - student-network
+
+  backend:
+    build: .
+    container_name: backend
+    depends_on:
+      - db
+    environment:
+      DB_HOST: db
+      DB_USER: yoru
+      DB_PASSWORD: newpassword
+      DB_NAME: studentdb
+      DB_PORT: 5432
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./uploads:/app/uploads
+    networks:
+      - student-network
+
+volumes:
+  postgres_data:
+
+networks:
+  student-network:
+    driver: bridge
