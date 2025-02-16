@@ -23,24 +23,74 @@ type ProgressInfo struct {
 	EndTime      time.Time
 }
 
-//	type UploadService struct {
-//		db *gorm.DB
-//	}
 type UploadService struct {
-	db               *gorm.DB
-	fileProgressMap  map[string]*ProgressInfo
-	fileProgressLock sync.RWMutex
+	db                *gorm.DB
+	fileProgressMap   map[string]*ProgressInfo
+	fileProgressLock  sync.RWMutex
+	progressListeners map[chan *ProgressInfo]bool // Track SSE listeners
+	listenerLock      sync.RWMutex
 }
 
-//	func NewUploadService(db *gorm.DB) *UploadService {
-//		return &UploadService{db: db}
-//	}
 func NewUploadService(db *gorm.DB) *UploadService {
 	return &UploadService{
-		db:              db,
-		fileProgressMap: make(map[string]*ProgressInfo),
+		db:                db,
+		fileProgressMap:   make(map[string]*ProgressInfo),
+		progressListeners: make(map[chan *ProgressInfo]bool),
 	}
 }
+
+func (s *UploadService) RegisterProgressListener(ch chan *ProgressInfo) {
+	s.listenerLock.Lock()
+	defer s.listenerLock.Unlock()
+	s.progressListeners[ch] = true
+}
+
+// UnregisterProgressListener removes a client from receiving progress updates
+func (s *UploadService) UnregisterProgressListener(ch chan *ProgressInfo) {
+	s.listenerLock.Lock()
+	defer s.listenerLock.Unlock()
+	delete(s.progressListeners, ch)
+}
+
+// BroadcastProgress sends progress updates to all registered listeners
+func (s *UploadService) BroadcastProgress(progress *ProgressInfo) {
+	s.listenerLock.RLock()
+	defer s.listenerLock.RUnlock()
+
+	for listener := range s.progressListeners {
+		select {
+		case listener <- progress:
+		default:
+			// Skip if the listener is not ready
+		}
+	}
+}
+
+// Update progress and broadcast to listeners
+func (s *UploadService) updateProgress(fileName string, processed int) {
+	s.fileProgressLock.Lock()
+	defer s.fileProgressLock.Unlock()
+
+	if progress, exists := s.fileProgressMap[fileName]; exists {
+		progress.Processed += processed
+		s.BroadcastProgress(progress)
+	}
+}
+
+// Update progress with error and broadcast to listeners
+func (s *UploadService) updateProgressError(fileName string, errorMsg string) {
+	s.fileProgressLock.Lock()
+	defer s.fileProgressLock.Unlock()
+
+	if progress, exists := s.fileProgressMap[fileName]; exists {
+		progress.Status = "error"
+		progress.Error = errorMsg
+		progress.EndTime = time.Now()
+		s.BroadcastProgress(progress)
+	}
+}
+
+////////////////////////////////////////////////////////
 
 func (s *UploadService) GetFileProgress(fileName string) *ProgressInfo {
 	s.fileProgressLock.RLock()
@@ -68,46 +118,6 @@ func (s *UploadService) GetAllFileProgress() []*ProgressInfo {
 
 	return result
 }
-
-//func (s *UploadService) ProcessCSV(filePath string) error {
-//	startTime := time.Now()
-//
-//	file, err := os.Open(filePath)
-//	if err != nil {
-//		return err
-//	}
-//	defer file.Close()
-//
-//	reader := csv.NewReader(file)
-//	reader.Read() // Skip header row
-//
-//	studentCh := make(chan []string, 1000)
-//	var wg sync.WaitGroup
-//	existingIDs := sync.Map{}
-//
-//	for i := 0; i < 5; i++ {
-//		wg.Add(1)
-//		go s.worker(studentCh, &existingIDs, &wg)
-//	}
-//
-//	for {
-//		record, err := reader.Read()
-//		if err == io.EOF {
-//			break
-//		}
-//		if err != nil {
-//			log.Println("Error reading CSV record:", err)
-//			continue
-//		}
-//		studentCh <- record
-//	}
-//
-//	close(studentCh)
-//	wg.Wait()
-//
-//	log.Printf("Processing completed in %v\n", time.Since(startTime))
-//	return nil
-//}
 
 func (s *UploadService) ProcessCSV(filePath string) error {
 	fileName := filepath.Base(filePath)
@@ -183,44 +193,6 @@ func (s *UploadService) ProcessCSV(filePath string) error {
 	return nil
 }
 
-//func (s *UploadService) worker(studentCh chan []string, existingIDs *sync.Map, wg *sync.WaitGroup) {
-//	defer wg.Done()
-//
-//	var students []model.Student
-//
-//	for record := range studentCh {
-//		studentID := record[0]
-//		if _, exists := existingIDs.Load(studentID); exists {
-//			log.Printf("Skipping duplicate student ID: %s\n", studentID)
-//			continue
-//		}
-//
-//		grade, err := strconv.Atoi(record[3])
-//		if err != nil {
-//			log.Println("Error converting grade to integer:", err)
-//			continue
-//		}
-//
-//		students = append(students, model.Student{
-//			StudentID:   studentID,
-//			StudentName: record[1],
-//			Subject:     record[2],
-//			Grade:       grade,
-//		})
-//
-//		existingIDs.Store(studentID, true)
-//
-//		if len(students) >= 1000 {
-//			s.saveBatch(students)
-//			students = nil
-//		}
-//	}
-//
-//	if len(students) > 0 {
-//		s.saveBatch(students)
-//	}
-//}
-
 func (s *UploadService) worker(fileName string, studentCh chan []string, existingIDs *sync.Map, wg *sync.WaitGroup) {
 	defer wg.Done()
 
@@ -269,26 +241,6 @@ func (s *UploadService) worker(fileName string, studentCh chan []string, existin
 	s.updateProgress(fileName, processedCount)
 }
 
-func (s *UploadService) updateProgress(fileName string, processed int) {
-	s.fileProgressLock.Lock()
-	defer s.fileProgressLock.Unlock()
-
-	if progress, exists := s.fileProgressMap[fileName]; exists {
-		progress.Processed += processed
-	}
-}
-
-func (s *UploadService) updateProgressError(fileName string, errorMsg string) {
-	s.fileProgressLock.Lock()
-	defer s.fileProgressLock.Unlock()
-
-	if progress, exists := s.fileProgressMap[fileName]; exists {
-		progress.Status = "error"
-		progress.Error = errorMsg
-		progress.EndTime = time.Now()
-	}
-}
-
 func (s *UploadService) countRecords(filePath string) (int, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -313,22 +265,6 @@ func (s *UploadService) countRecords(filePath string) (int, error) {
 
 	return count, nil
 }
-
-//
-//func (s *UploadService) saveBatch(students []model.Student) {
-//	if len(students) == 0 {
-//		return
-//	}
-//
-//	err := s.db.Transaction(func(tx *gorm.DB) error {
-//		return tx.Create(&students).Error
-//	})
-//	if err != nil {
-//		log.Println("Error inserting batch into database:", err)
-//	} else {
-//		log.Printf("Inserted %d students into database\n", len(students))
-//	}
-//}
 
 func (s *UploadService) saveBatch(students []model.Student) {
 	if len(students) == 0 {

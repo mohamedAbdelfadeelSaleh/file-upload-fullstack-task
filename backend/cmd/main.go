@@ -1,7 +1,7 @@
 package main
 
 import (
-	_ "backend/internal/config"
+	"backend/internal/config"
 	"backend/internal/database"
 	"backend/internal/handler"
 	"backend/internal/service"
@@ -13,6 +13,10 @@ import (
 )
 
 func main() {
+	if err := config.LoadConfig(); err != nil {
+		log.Fatal("Failed to load config:", err)
+	}
+
 	// Initialize database
 	db := database.InitDB()
 
@@ -28,15 +32,14 @@ func main() {
 	r := mux.NewRouter()
 
 	r.HandleFunc("/upload", uploadHandler.UploadCSV).Methods("POST")
+
 	r.HandleFunc("/students", studentHandler.ListStudents).Methods("GET")
 
 	////////////////////////////////////////////////////////////////////////////////////////
 	progressHandler := handler.NewProgressHandler(uploadService)
 
-	r.HandleFunc("/progress", progressHandler.GetAllProgress).Methods("GET")
-	r.HandleFunc("/progress/file", progressHandler.GetFileProgress).Methods("GET")
-
-	////////////////////////////////////////////////////////////////////////////////////////
+	r.HandleFunc("/progress/sse", progressHandler.SSEProgress).Methods("GET")
+	//////////////////////////////////////////////////////////////////////////////////////
 	// Create uploads directory
 	if err := os.Mkdir("uploads", os.ModePerm); err != nil && !os.IsExist(err) {
 		log.Fatal("Failed to create uploads directory:", err)
@@ -44,5 +47,8 @@ func main() {
 
 	// Start server
 	log.Println("Server running on port 8080")
-	http.ListenAndServe(":8080", handlers.CORS(handlers.AllowedOrigins([]string{"http://localhost:3000"}))(r))
+	err := http.ListenAndServe(":8080", handlers.CORS(handlers.AllowedOrigins([]string{"http://localhost:3000"}))(r))
+	if err != nil {
+		return
+	}
 }
