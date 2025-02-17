@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 	"log"
+
 	"time"
 )
 
@@ -22,6 +24,8 @@ func InitDB() *gorm.DB {
 
 	// Open database connection
 	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	db.Logger = logger.Default.LogMode(logger.Silent)
+
 	if err != nil {
 		log.Fatal("Failed to connect to the database:", err)
 	}
@@ -41,4 +45,15 @@ func InitDB() *gorm.DB {
 	}
 
 	return db
+}
+
+func TruncateAllTables(db *gorm.DB) error {
+	tables := []string{"students"} // Add all table names here
+
+	for _, table := range tables {
+		if err := db.Exec(fmt.Sprintf("TRUNCATE TABLE %s RESTART IDENTITY CASCADE;", table)).Error; err != nil {
+			return fmt.Errorf("failed to truncate table %s: %w", table, err)
+		}
+	}
+	return nil
 }

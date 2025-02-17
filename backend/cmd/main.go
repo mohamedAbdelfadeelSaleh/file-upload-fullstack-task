@@ -20,6 +20,10 @@ func main() {
 	// Initialize database
 	db := database.InitDB()
 
+	if err := database.TruncateAllTables(db); err != nil {
+		log.Fatal(err)
+	}
+
 	// Initialize services
 	studentService := service.NewStudentService(db)
 	uploadService := service.NewUploadService(db)

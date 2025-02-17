@@ -6,8 +6,10 @@ import (
 	"gorm.io/gorm"
 	"io"
 	"log"
+	//"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 	"time"
@@ -29,13 +31,21 @@ type UploadService struct {
 	fileProgressLock  sync.RWMutex
 	progressListeners map[chan *ProgressInfo]bool // Track SSE listeners
 	listenerLock      sync.RWMutex
+
+	////////////////////////////////////
+	workerSemaphore      chan struct{} // Semaphore to limit total workers
+	maxConcurrentWorkers int
 }
 
 func NewUploadService(db *gorm.DB) *UploadService {
+	maxWorkers := runtime.NumCPU() * 2 // Reasonable default
+
 	return &UploadService{
-		db:                db,
-		fileProgressMap:   make(map[string]*ProgressInfo),
-		progressListeners: make(map[chan *ProgressInfo]bool),
+		db:                   db,
+		fileProgressMap:      make(map[string]*ProgressInfo),
+		progressListeners:    make(map[chan *ProgressInfo]bool),
+		workerSemaphore:      make(chan struct{}, maxWorkers),
+		maxConcurrentWorkers: maxWorkers,
 	}
 }
 
@@ -66,13 +76,16 @@ func (s *UploadService) BroadcastProgress(progress *ProgressInfo) {
 	}
 }
 
-// Update progress and broadcast to listeners
 func (s *UploadService) updateProgress(fileName string, processed int) {
 	s.fileProgressLock.Lock()
 	defer s.fileProgressLock.Unlock()
 
 	if progress, exists := s.fileProgressMap[fileName]; exists {
 		progress.Processed += processed
+		// Ensure that Processed does not exceed TotalRecords
+		if progress.Processed > progress.TotalRecords {
+			progress.Processed = progress.TotalRecords
+		}
 		s.BroadcastProgress(progress)
 	}
 }
@@ -134,6 +147,17 @@ func (s *UploadService) ProcessCSV(filePath string) error {
 	}
 	s.fileProgressLock.Unlock()
 
+	// Get file info for size
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
+		s.updateProgressError(fileName, "Failed to get file info: "+err.Error())
+		return err
+	}
+
+	// Calculate number of workers based on file size
+	numWorkers := calculateWorkers(fileInfo.Size())
+	log.Printf("Using %d workers for file %s (size: %d bytes)\n", numWorkers, fileName, fileInfo.Size())
+
 	file, err := os.Open(filePath)
 	if err != nil {
 		s.updateProgressError(fileName, "Failed to open file: "+err.Error())
@@ -157,28 +181,39 @@ func (s *UploadService) ProcessCSV(filePath string) error {
 	reader := csv.NewReader(file)
 	reader.Read() // Skip header row
 
-	studentCh := make(chan []string, 1000)
+	// Buffer size based on number of workers
+	bufferSize := 1000
+	if numWorkers > 10 {
+		bufferSize = numWorkers * 100
+	}
+
+	studentCh := make(chan []string, bufferSize)
 	var wg sync.WaitGroup
 	existingIDs := sync.Map{}
 
-	for i := 0; i < 5; i++ {
+	// Launch workers
+	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go s.worker(fileName, studentCh, &existingIDs, &wg)
 	}
 
-	for {
-		record, err := reader.Read()
-		if err == io.EOF {
-			break
+	// Read records and send them to workers
+	go func() {
+		for {
+			record, err := reader.Read()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				log.Println("Error reading CSV record:", err)
+				continue
+			}
+			studentCh <- record
 		}
-		if err != nil {
-			log.Println("Error reading CSV record:", err)
-			continue
-		}
-		studentCh <- record
-	}
+		close(studentCh) // Close the channel after all records are read
+	}()
 
-	close(studentCh)
+	// Wait for all workers to finish
 	wg.Wait()
 
 	// Update progress as completed
@@ -186,15 +221,55 @@ func (s *UploadService) ProcessCSV(filePath string) error {
 	if progress, exists := s.fileProgressMap[fileName]; exists {
 		progress.Status = "completed"
 		progress.EndTime = time.Now()
+		progress.Processed = progress.TotalRecords // Ensure processed equals total records
+		s.BroadcastProgress(progress)
 	}
 	s.fileProgressLock.Unlock()
 
+	// Log processing completion
 	log.Printf("Processing completed for %s in %v\n", fileName, time.Since(startTime))
+
 	return nil
 }
 
+// calculateWorkers determines the appropriate number of workers based on file size
+func calculateWorkers(fileSize int64) int {
+	// Base calculations on available CPUs
+	cpus := runtime.NumCPU()
+
+	// For very small files (< 1MB), use just 2 workers
+	if fileSize < 1_000_000 {
+		return min(2, cpus)
+	}
+
+	// For small files (1-10MB), use up to 4 workers
+	if fileSize < 10_000_000 {
+		return min(4, cpus)
+	}
+
+	// For medium files (10-100MB), scale up to 8 workers
+	if fileSize < 100_000_000 {
+		return min(8, cpus)
+	}
+
+	// For large files (100MB-1GB), scale up to 16 workers
+	if fileSize < 1_000_000_000 {
+		return min(16, cpus)
+	}
+
+	// For very large files (>1GB), use all available CPUs
+	return cpus
+}
+
 func (s *UploadService) worker(fileName string, studentCh chan []string, existingIDs *sync.Map, wg *sync.WaitGroup) {
-	defer wg.Done()
+	s.workerSemaphore <- struct{}{}
+	defer func() {
+		// Release semaphore
+		<-s.workerSemaphore
+		wg.Done() // Only call wg.Done() once here
+	}()
+
+	// Remove this duplicate defer wg.Done()
 
 	var students []model.Student
 	processedCount := 0
@@ -271,12 +346,24 @@ func (s *UploadService) saveBatch(students []model.Student) {
 		return
 	}
 
-	err := s.db.Transaction(func(tx *gorm.DB) error {
-		return tx.Create(&students).Error
-	})
+	var values []interface{}
+	query := "INSERT INTO students (student_id, student_name, subject, grade) VALUES "
+
+	for i, student := range students {
+		if i > 0 {
+			query += ","
+		}
+		query += "(?, ?, ?, ?)"
+		values = append(values, student.StudentID, student.StudentName, student.Subject, student.Grade)
+	}
+
+	query += " ON CONFLICT (student_id) DO NOTHING"
+
+	err := s.db.Exec(query, values...).Error
+
 	if err != nil {
-		log.Println("Error inserting batch into database:", err)
+		//log.Println("Error inserting batch into database:", err)
 	} else {
-		log.Printf("Inserted %d students into database\n", len(students))
+		//log.Printf("Inserted %d students into database\n", len(students))
 	}
 }
